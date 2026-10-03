@@ -6,6 +6,7 @@ Mixin split out of ``cli.py``; bound onto ``HermesCLI`` via the MRO.
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
 import queue
@@ -30,6 +31,7 @@ class CLITuiRuntimeMixin:
 
     def _tui_process_loop(self):
         """REPL worker thread: drain ``_pending_input``, run idle housekeeping, dispatch each input."""
+        self._tui_restore_pending_input_from_disk()
         while not self._should_exit:
             try:
                 try:
@@ -45,6 +47,47 @@ class CLITuiRuntimeMixin:
                     logger.warning("process_loop EIO — freezing UI paints (#81521): %s", e)
                     continue
                 logger.warning("process_loop unhandled error (msg may be lost): %s", e)
+
+    # process_loop dispatches each input inline; one blocking call (voice teardown) can
+    # stall the whole queue with no log. Persist undispatched prompts so a restart
+    # doesn't silently destroy them.
+
+    _PENDING_INPUT_DIR = "pending_input"  # under $HERMES_HOME; restored on next startup
+
+    def _tui_persist_pending_input_to_disk(self):
+        """On shutdown, save any never-dispatched queued prompts so restart doesn't lose them."""
+        try:
+            items = list(self._pending_input.queue)
+        except Exception:
+            return
+        if not items:
+            return
+        path = get_hermes_home() / self._PENDING_INPUT_DIR
+        path.mkdir(parents=True, exist_ok=True)
+        text_items = [it[0] if isinstance(it, tuple) and isinstance(it[0], str) else str(it)
+                      for it in items]
+        (path / f"{getattr(self, 'session_id', None) or 'default'}.json").write_text(
+            json.dumps(text_items), encoding="utf-8")
+
+    def _tui_restore_pending_input_from_disk(self):
+        """On startup, re-queue prompts persisted by a previous crashed/killed session."""
+        directory = get_hermes_home() / self._PENDING_INPUT_DIR
+        if not directory.is_dir():
+            return
+        from cli import _cprint
+        for path in sorted(directory.glob("*.json")):
+            try:
+                items = [s for s in json.loads(path.read_text(encoding="utf-8"))
+                         if isinstance(s, str) and s.strip()]
+                for item in items:
+                    self._pending_input.put(item)
+                if items:
+                    _cprint(f"  Restored {len(items)} queued message(s) from a previous session: {path}")
+            except Exception as e:
+                logger.debug("queued-input restore failed for %s: %s", path, e)
+            finally:
+                path.unlink(missing_ok=True)  # consumed (or unreadable) either way
+
 
     def _tui_idle_tick(self):
         """Idle housekeeping between inputs (agent not running)."""
@@ -454,6 +497,10 @@ class CLITuiRuntimeMixin:
         """Teardown after the app exits: interrupt agent, stop voice/pet, persist + close session, cleanup, exit summary."""
         from cli import _DIM, _RST, _cprint, _invoke_interrupted_session_end, _run_cleanup, set_approval_callback, set_secret_capture_callback, set_sudo_password_callback
         self._should_exit = True
+        # Save queued-but-never-dispatched prompts BEFORE anything else can fail/exit:
+        # a wedged process_loop's queue would otherwise be silently destroyed (#16803 class).
+        with suppress(Exception):
+            self._tui_persist_pending_input_to_disk()
         self._pet_stop_anim()
         # Without this line the terminal sits silent through the whole cleanup window.
         with suppress(Exception):
